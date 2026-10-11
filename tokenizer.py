@@ -32,6 +32,7 @@ def merge_pair(chunk, pair, new_id):
             i+=1
     return tuple(merged)
 
+# training: breaks down text into chunks and performs merges based on pair count frequency
 def train_bpe(text, num_merges):
     chunk_freq = Counter(pretokenize(text))
     vocab = {i: bytes([i]) for i in range(256)}
@@ -41,3 +42,66 @@ def train_bpe(text, num_merges):
         pair_counts = get_pair_counts(chunk_freq)
         if not pair_counts:
             break
+        best_pair = max(pair_counts, key=pair_counts.get)
+
+        new_chunk_freq = Counter()
+        for chunk, freq in chunk_freq.items():
+            new_chunk_freq[merge_pair(chunk, best_pair, next_id)] += freq
+        chunk_freq = new_chunk_freq
+
+        merges[best_pair] = next_id
+        vocab[next_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
+        next_id += 1
+
+        if (step + 1) % 50 == 0 or step == num_merges - 1:
+            print(f" merges {step + 1}/{num_merges}: {best_pair} -> {next_id - 1} "
+                  f"({vocab[next_id - 1]})")
+    return merges, vocab
+
+class BPETokenize:
+    def __init__(self):
+        self.merges = {}
+        self.vocab = {i: bytes([i]) for i in range(256)}
+
+    @property
+    def vocab_size(self):
+        return len(self.vocab)
+
+    def train(self, text, num_merges):
+        self.merges, self.vocab = train_bpe(text, num_merges)
+
+    # mirrors the training process and outputs token ids for the text based on merges
+    def encode(self, text):
+        chunks = pretokenize(text)
+        token_ids = []
+        for chunk in chunks:
+            tokens = list(chunk)
+            while len(tokens) >= 2:
+                pairs = [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+                mergable = [p for p in pairs if p in self.merges]
+                if not mergable:
+                    break
+                pair_to_merge = min(mergable, key=lambda p : self.merges[p])
+                new_id = self.merges[pair_to_merge]
+                tokens = list(merge_pair(tuple(tokens), pair_to_merge, new_id))
+            token_ids.extend(tokens)
+        return token_ids
+
+    # turns a list of token ids back into text
+    def decode(self, token_ids):
+        byte_seq = b"".join(self.vocab[t] for t in token_ids)
+        return byte_seq.decode("utf-8", errors="replace")
+
+    def save(self, path):
+        data = {"merges": [[list(pair), new_id] for pair, new_id in self.merges.items()]}
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def load(self, path):
+        with open(path) as f:
+            data = json.load(f)
+        self.merges = {}
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        for (a, b), new_id in data["merges"]:
+            self.merges[(a, b)] = new_id
+            self.vocab[new_id] = self.vocab[a] + self.vocab[b]

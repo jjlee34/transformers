@@ -39,14 +39,14 @@ class MultiHeadSelfAttention(nn.Module):
         attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
 
         # apply causal mask
-        attn_scores = attn_scores.masked_fill(-self.causal_mask[:T, :T], float('-inf'))
+        attn_scores = attn_scores.masked_fill(~self.causal_mask[:T, :T], float('-inf'))
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         out = attn_weights @ v
 
         # merge heads back into (B, T, C)
-        out = out.transpose(1, 2). continguous().view(B, T, C)
+        out = out.transpose(1, 2). contiguous().view(B, T, C)
         return self.out_proj(out)
 
 class MLP(nn.Module):
@@ -63,7 +63,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model_, n_heads, max_seq_len=1024, dropout=0.0):
+    def __init__(self, d_model, n_heads, max_seq_len=1024, dropout=0.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = MultiHeadSelfAttention(d_model, n_heads, max_seq_len, dropout)
@@ -85,3 +85,60 @@ if __name__ == "__main__":
 
     print("input shape: ", x.shape)
     print("output shape: ", out.shape)
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=4,
+                 max_seq_len=256, dropout=0.0):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, max_seq_len, dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        self.lm_head.weight = self.token_emb.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        # B: batch size, T: length of sequences (context window)
+        B, T = idx.shape
+        assert T <= self.max_seq_len, f"sequence lenght {T} exceeds max_seq_len {self.max_seq_len}"
+
+        positions = torch.arange(T, device=idx.device)
+        x = self.token_emb(idx) + self.pos_emb(positions)
+        x = self.drop(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.max_seq_len:]
