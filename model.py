@@ -142,3 +142,5 @@ class GPT(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.max_seq_len:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
