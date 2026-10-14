@@ -144,3 +144,22 @@ class GPT(nn.Module):
             idx_cond = idx[:, -self.max_seq_len:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, -1, :] / temperature]
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_id], dim=1)
+        return idx
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    B, T, d_model, n_heads = 2, 16, 256, 8
+
+    block = TransformerBlock(d_model, n_heads, max_seq_len=T)
+    x = torch.randn(B, T, d_model)
+    out = block(x)
+
+    print("input shape: ", x.shape)
+    print("output shape:", out.shape)
