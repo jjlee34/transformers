@@ -86,4 +86,33 @@ def estimate_loss(eval_iters=8):
             x, y = get_batch(split, BATCH_SIZE)
             _, loss = model(x, y)
             losses[i] = loss.item()
-            
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+print(f"\nTraining for {MAX_STEPS} steps on {device}...")
+t0 = time.time()
+for step in range(MAX_STEPS):
+    xb, yb = get_batch("train", BATCH_SIZE)
+    logits, loss = model(xb, yb)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+    if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
+        losses = estimate_loss()
+        elapsed = time.time() - t0
+        print(f"  step {step:4d} | train loss {losses['train']:.3f} | "
+              f"val loss {losses['val']:.3f} | {elapsed:.1f}s elapsed")
+
+print(f"\nTraining done in {time.time() - t0:.1f}s")
+torch.save(model.state_dict(), "mini_gpt.pt")
+print("Model weights saved to mini_gpt.pt")
+
+model.eval()
+print("\n--- Sample generation (prompt: 'ROMEO:') ---")
+prompt_ids = tok.encode("ROMEO:")
+idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+out_ids = model.generate(idx, max_new_tokens=200, temperature=0.8, top_k=40)
+print(tok.decode(out_ids[0].tolist()))
