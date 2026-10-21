@@ -9,7 +9,7 @@ GPT2_SPLIT_PATTERN = re.compile(
 # pre-processing: turns the text into list of byte-tuples
 def pretokenize(text):
     chunks = re.findall(GPT2_SPLIT_PATTERN, text)
-    return [tuple(chunks.encode("utf-8")) for chunk in chunks]
+    return [tuple(chunk.encode("utf-8")) for chunk in chunks]
 
 # pre-processing: calculates pair counts using chunk frequency; simple version
 def get_pair_counts(chunk_freq):
@@ -58,7 +58,7 @@ def train_bpe(text, num_merges):
                   f"({vocab[next_id - 1]})")
     return merges, vocab
 
-class BPETokenize:
+class BPETokenizer:
     def __init__(self):
         self.merges = {}
         self.vocab = {i: bytes([i]) for i in range(256)}
