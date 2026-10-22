@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import urllib.request
@@ -21,7 +22,7 @@ if not os.path.exists(DATA_PATH):
 
 with open(DATA_PATH) as f:
     text = f.read()
-print(f"Corpus length: {len}")
+print(f"Corpus length: {len(text):,}")
 
 # tokenizer
 
@@ -60,24 +61,44 @@ def get_batch(split, batch_size):
 
 model = GPT(
     vocab_size=tok.vocab_size,
-    d_model=128,
-    n_heads=4,
-    n_layers=4,
+    d_model=256,
+    n_heads=8,
+    n_layers=6,
     max_seq_len=BLOCK_SIZE,
-    dropout=0.1
+    dropout=0.2
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 print(f"\nModel parameters: {n_params:,}")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-
 BATCH_SIZE = 32
-MAX_STEPS = 400
+MAX_STEPS = 4000
 EVAL_INTERVAL = 100
 
+# learning rate: linear warmup, then cosine decay down to MIN_LR
+MAX_LR = 1e-3
+MIN_LR = 1e-4
+WARMUP_STEPS = 100
+
+def get_lr(step):
+    if step < WARMUP_STEPS:
+        return MAX_LR * (step + 1) / WARMUP_STEPS
+    progress = (step - WARMUP_STEPS) / max(1, MAX_STEPS - WARMUP_STEPS)
+    return MIN_LR + 0.5 * (MAX_LR - MIN_LR) * (1 + math.cos(math.pi * progress))
+
+# weight decay on matrices only; biases and LayerNorm weights are left alone
+decay = [p for p in model.parameters() if p.dim() >= 2]
+no_decay = [p for p in model.parameters() if p.dim() < 2]
+optimizer = torch.optim.AdamW([
+    {"params": decay, "weight_decay": 0.1},
+    {"params": no_decay, "weight_decay": 0.0},
+], lr=MAX_LR, betas=(0.9, 0.95))
+
+GRAD_CLIP = 1.0
+CKPT_PATH = "mini_gpt.pt"
+
 @torch.no_grad()
-def estimate_loss(eval_iters=8):
+def estimate_loss(eval_iters=50):
     model.eval()
     out = {}
     for split in ("train", "val"):
@@ -92,24 +113,38 @@ def estimate_loss(eval_iters=8):
 
 print(f"\nTraining for {MAX_STEPS} steps on {device}...")
 t0 = time.time()
+best_val = float("inf")
+best_step = None
 for step in range(MAX_STEPS):
+    lr = get_lr(step)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
     xb, yb = get_batch("train", BATCH_SIZE)
     logits, loss = model(xb, yb)
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
     optimizer.step()
 
     if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
         losses = estimate_loss()
         elapsed = time.time() - t0
+        marker = ""
+        # keep only the checkpoint with the lowest val loss
+        if losses["val"] < best_val:
+            best_val, best_step = losses["val"], step
+            torch.save(model.state_dict(), CKPT_PATH)
+            marker = " *"
         print(f"  step {step:4d} | train loss {losses['train']:.3f} | "
-              f"val loss {losses['val']:.3f} | {elapsed:.1f}s elapsed")
+              f"val loss {losses['val']:.3f} | lr {lr:.2e} | {elapsed:.1f}s elapsed{marker}")
 
 print(f"\nTraining done in {time.time() - t0:.1f}s")
-torch.save(model.state_dict(), "mini_gpt.pt")
-print("Model weights saved to mini_gpt.pt")
+print(f"Best val loss {best_val:.3f} at step {best_step}, saved to {CKPT_PATH}")
 
+# sample from the best checkpoint, not the final weights
+model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
 model.eval()
 print("\n--- Sample generation (prompt: 'ROMEO:') ---")
 prompt_ids = tok.encode("ROMEO:")
