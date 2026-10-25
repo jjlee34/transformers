@@ -1,8 +1,7 @@
 import math
 import os
 import time
-import urllib.request
-
+import numpy as np
 import torch
 
 from tokenizer import BPETokenizer
@@ -11,50 +10,29 @@ from model import GPT
 torch.manual_seed(0)
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-# corpus
+# data: token ids written by prepare_data.py
 
-DATA_PATH = "input.txt"
-DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+DATA_DIR = "data"
+if not os.path.exists(os.path.join(DATA_DIR, "train.bin")):
+    raise SystemExit("No prepared data found. Run `python prepare_data.py` first.")
 
-if not os.path.exists(DATA_PATH):
-    print("Downloading Tiny Shakespeare...")
-    urllib.request.urlretrieve(DATA_URL, DATA_PATH)
-
-with open(DATA_PATH) as f:
-    text = f.read()
-print(f"Corpus length: {len(text):,}")
-
-# tokenizer
-
-VOCAB_SIZE = 512
-num_merges = VOCAB_SIZE - 256
-
-print(f"\nTraining BPE tokenizer (vocab_size={VOCAB_SIZE})... ")
 tok = BPETokenizer()
-# subset to learn good merges fast
-train_text = text[:300_000]
-tok.train(train_text, num_merges=num_merges)
-tok.save("mini_tokenizer.json")
-print(f"Tokenizer trained and saved. Actual vocab size: {tok.vocab_size}")
+tok.load(os.path.join(DATA_DIR, "tokenizer.json"))
+print(f"Tokenizer vocab size: {tok.vocab_size}")
 
-# encoding
-print("\nEncoding full corpus...")
-t0 = time.time()
-ids = tok.encode(text)
-print(f"Encoded {len(text):,} chars -> {len(ids):,} tokens "
-      f"({len(text) / len(ids):.2f} chars/token) in {time.time() - t0:.1f}s")
-data = torch.tensor(ids, dtype=torch.long)
-n = int(0.9 * len(data))
-train_data, val_data = data[:n], data[n:]
+# memmap reads windows straight from disk, so the dataset doesn't have to fit in RAM
+train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
+val_data = np.memmap(os.path.join(DATA_DIR, "val.bin"), dtype=np.uint16, mode="r")
+print(f"Train tokens: {len(train_data):,} | val tokens: {len(val_data):,}")
 
-# context length
-BLOCK_SIZE = 128
+# context length; most TinyStories fit in 256 tokens
+BLOCK_SIZE = 256
 
 def get_batch(split, batch_size):
     d = train_data if split == "train" else val_data
-    ix = torch.randint(len(d) - BLOCK_SIZE - 1, (batch_size,))
-    x = torch.stack([d[i:i + BLOCK_SIZE] for i in ix])
-    y = torch.stack([d[i + 1:i + BLOCK_SIZE + 1] for i in ix])
+    ix = torch.randint(len(d) - BLOCK_SIZE - 1, (batch_size,)).tolist()
+    x = torch.stack([torch.from_numpy(d[i:i + BLOCK_SIZE].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(d[i + 1:i + BLOCK_SIZE + 1].astype(np.int64)) for i in ix])
     return x.to(device), y.to(device)
 
 # model and training loop
@@ -65,7 +43,8 @@ model = GPT(
     n_heads=8,
     n_layers=6,
     max_seq_len=BLOCK_SIZE,
-    dropout=0.2
+    # each token is seen less than once, so there is nothing to memorize and no need for dropout
+    dropout=0.0
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -146,8 +125,8 @@ print(f"Best val loss {best_val:.3f} at step {best_step}, saved to {CKPT_PATH}")
 # sample from the best checkpoint, not the final weights
 model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
 model.eval()
-print("\n--- Sample generation (prompt: 'ROMEO:') ---")
-prompt_ids = tok.encode("ROMEO:")
+print("\n--- Sample generation (prompt: 'Once upon a time') ---")
+prompt_ids = tok.encode("Once upon a time")
 idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 out_ids = model.generate(idx, max_new_tokens=200, temperature=0.8, top_k=40)
 print(tok.decode(out_ids[0].tolist()))

@@ -62,6 +62,10 @@ class BPETokenizer:
     def __init__(self):
         self.merges = {}
         self.vocab = {i: bytes([i]) for i in range(256)}
+        # special tokens like <|endoftext|> get their own id and are never split by BPE
+        self.special_tokens = {}
+        # chunk -> token ids; text repeats the same words constantly, so this saves re-merging
+        self._cache = {}
 
     @property
     def vocab_size(self):
@@ -69,12 +73,35 @@ class BPETokenizer:
 
     def train(self, text, num_merges):
         self.merges, self.vocab = train_bpe(text, num_merges)
+        self._cache = {}
+
+    def add_special_token(self, token):
+        new_id = len(self.vocab)
+        self.special_tokens[token] = new_id
+        self.vocab[new_id] = token.encode("utf-8")
+        return new_id
 
     # mirrors the training process and outputs token ids for the text based on merges
     def encode(self, text):
+        if self.special_tokens:
+            pattern = "(" + "|".join(re.escape(t) for t in self.special_tokens) + ")"
+            token_ids = []
+            for part in re.split(pattern, text):
+                if part in self.special_tokens:
+                    token_ids.append(self.special_tokens[part])
+                elif part:
+                    token_ids.extend(self._encode_ordinary(part))
+            return token_ids
+        return self._encode_ordinary(text)
+
+    def _encode_ordinary(self, text):
         chunks = pretokenize(text)
         token_ids = []
         for chunk in chunks:
+            cached = self._cache.get(chunk)
+            if cached is not None:
+                token_ids.extend(cached)
+                continue
             tokens = list(chunk)
             while len(tokens) >= 2:
                 pairs = [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
@@ -84,6 +111,7 @@ class BPETokenizer:
                 pair_to_merge = min(mergable, key=lambda p : self.merges[p])
                 new_id = self.merges[pair_to_merge]
                 tokens = list(merge_pair(tuple(tokens), pair_to_merge, new_id))
+            self._cache[chunk] = tokens
             token_ids.extend(tokens)
         return token_ids
 
@@ -93,7 +121,10 @@ class BPETokenizer:
         return byte_seq.decode("utf-8", errors="replace")
 
     def save(self, path):
-        data = {"merges": [[list(pair), new_id] for pair, new_id in self.merges.items()]}
+        data = {
+            "merges": [[list(pair), new_id] for pair, new_id in self.merges.items()],
+            "special_tokens": self.special_tokens,
+        }
         with open(path, "w") as f:
             json.dump(data, f)
 
@@ -105,3 +136,7 @@ class BPETokenizer:
         for (a, b), new_id in data["merges"]:
             self.merges[(a, b)] = new_id
             self.vocab[new_id] = self.vocab[a] + self.vocab[b]
+        self.special_tokens = data.get("special_tokens", {})
+        for token, new_id in self.special_tokens.items():
+            self.vocab[new_id] = token.encode("utf-8")
+        self._cache = {}
