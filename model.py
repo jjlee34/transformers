@@ -45,6 +45,17 @@ class MultiHeadSelfAttention(nn.Module):
         attn_weights = self.dropout(attn_weights)
         out = attn_weights @ v
 
+        # the four steps above can be replaced by one fused call. it computes the
+        # same thing without storing the (T, T) score matrix; on CUDA it uses
+        # FlashAttention and is much faster, but on MPS it measured ~5% slower here.
+        # it scales by 1/sqrt(d_head) itself, and is_causal=True applies the mask,
+        # so the causal_mask buffer in __init__ would no longer be needed.
+        # out = F.scaled_dot_product_attention(
+        #     q, k, v,
+        #     is_causal=True,
+        #     dropout_p=self.dropout.p if self.training else 0.0,
+        # )
+
         # merge heads back into (B, T, C)
         out = out.transpose(1, 2). contiguous().view(B, T, C)
         return self.out_proj(out)
@@ -139,7 +150,7 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eot_id=None):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.max_seq_len:]
             logits, _ = self(idx_cond)
@@ -151,6 +162,9 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
+            # stop once every sequence in the batch has produced <|endoftext|>
+            if eot_id is not None and (next_id == eot_id).all():
+                break
         return idx
 
 if __name__ == "__main__":

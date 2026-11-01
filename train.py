@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import time
@@ -37,22 +38,29 @@ def get_batch(split, batch_size):
 
 # model and training loop
 
-model = GPT(
+# saved inside the checkpoint so sample.py can rebuild the same model
+MODEL_CONFIG = dict(
     vocab_size=tok.vocab_size,
     d_model=256,
     n_heads=8,
     n_layers=6,
     max_seq_len=BLOCK_SIZE,
-    # each token is seen less than once, so there is nothing to memorize and no need for dropout
-    dropout=0.0
-).to(device)
+    # each token is seen about once, so there is nothing to memorize and no need for dropout
+    dropout=0.0,
+)
+model = GPT(**MODEL_CONFIG).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 print(f"\nModel parameters: {n_params:,}")
 
 BATCH_SIZE = 32
-MAX_STEPS = 4000
-EVAL_INTERVAL = 100
+EPOCHS = 1
+# one epoch = as many tokens as the training set holds. batches are random windows,
+# so this is one epoch on average, not a guarantee that every token is seen exactly once
+TOKENS_PER_STEP = BATCH_SIZE * BLOCK_SIZE
+MAX_STEPS = int(EPOCHS * len(train_data) // TOKENS_PER_STEP)
+# each eval runs 100 batches without training, so evaluating less often saves time
+EVAL_INTERVAL = 250
 
 # learning rate: linear warmup, then cosine decay down to MIN_LR
 MAX_LR = 1e-3
@@ -76,6 +84,13 @@ optimizer = torch.optim.AdamW([
 GRAD_CLIP = 1.0
 CKPT_PATH = "mini_gpt.pt"
 
+# one CSV per run, named by start time, so runs can be compared with plot_losses.py
+os.makedirs("logs", exist_ok=True)
+LOG_PATH = os.path.join("logs", time.strftime("run_%Y%m%d_%H%M%S.csv"))
+log_file = open(LOG_PATH, "w", newline="")
+log = csv.writer(log_file)
+log.writerow(["step", "tokens", "train_loss", "val_loss", "lr", "elapsed_s"])
+
 @torch.no_grad()
 def estimate_loss(eval_iters=50):
     model.eval()
@@ -90,7 +105,8 @@ def estimate_loss(eval_iters=50):
     model.train()
     return out
 
-print(f"\nTraining for {MAX_STEPS} steps on {device}...")
+print(f"\nTraining for {MAX_STEPS} steps ({EPOCHS} epoch, {MAX_STEPS * TOKENS_PER_STEP:,} tokens) on {device}...")
+print(f"Logging to {LOG_PATH}")
 t0 = time.time()
 best_val = float("inf")
 best_step = None
@@ -114,19 +130,30 @@ for step in range(MAX_STEPS):
         # keep only the checkpoint with the lowest val loss
         if losses["val"] < best_val:
             best_val, best_step = losses["val"], step
-            torch.save(model.state_dict(), CKPT_PATH)
+            torch.save({
+                "model": model.state_dict(),
+                "config": MODEL_CONFIG,
+                "step": step,
+                "val_loss": best_val,
+            }, CKPT_PATH)
             marker = " *"
-        print(f"  step {step:4d} | train loss {losses['train']:.3f} | "
+        print(f"  step {step:5d} | train loss {losses['train']:.3f} | "
               f"val loss {losses['val']:.3f} | lr {lr:.2e} | {elapsed:.1f}s elapsed{marker}")
+        log.writerow([step, (step + 1) * TOKENS_PER_STEP, f"{losses['train']:.4f}",
+                      f"{losses['val']:.4f}", f"{lr:.3e}", f"{elapsed:.1f}"])
+        log_file.flush()
 
+log_file.close()
 print(f"\nTraining done in {time.time() - t0:.1f}s")
 print(f"Best val loss {best_val:.3f} at step {best_step}, saved to {CKPT_PATH}")
 
 # sample from the best checkpoint, not the final weights
-model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
+model.load_state_dict(torch.load(CKPT_PATH, map_location=device)["model"])
 model.eval()
 print("\n--- Sample generation (prompt: 'Once upon a time') ---")
 prompt_ids = tok.encode("Once upon a time")
 idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-out_ids = model.generate(idx, max_new_tokens=200, temperature=0.8, top_k=40)
-print(tok.decode(out_ids[0].tolist()))
+eot_id = tok.special_tokens["<|endoftext|>"]
+# generation stops early at <|endoftext|>, so the limit can cover a whole story
+out_ids = model.generate(idx, max_new_tokens=400, temperature=0.8, top_k=40, eot_id=eot_id)
+print(tok.decode([t for t in out_ids[0].tolist() if t != eot_id]))
