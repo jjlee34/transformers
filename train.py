@@ -38,7 +38,7 @@ def get_batch(split, batch_size):
 
 # model and training loop
 
-# saved inside the checkpoint so sample.py can rebuild the same model
+# saved inside the checkpoint so inference.py can rebuild the same model
 MODEL_CONFIG = dict(
     vocab_size=tok.vocab_size,
     d_model=256,
