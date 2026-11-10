@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 
 import torch
@@ -10,12 +11,20 @@ from tokenizer import BPETokenizer
 # usage:
 #   python inference.py
 #   python inference.py --prompt "Lily had a red ball" --num_samples 3 --temperature 0.7
+#   python inference.py --ckpt checkpoints/rmsnorm.pt
+
+def latest_checkpoint():
+    # newest file in checkpoints/, falling back to the older single-file location
+    ckpts = glob.glob(os.path.join("checkpoints", "*.pt"))
+    return max(ckpts, key=os.path.getmtime) if ckpts else "mini_gpt.pt"
 
 def load_model(path, device):
     ckpt = torch.load(path, map_location=device)
     if "config" in ckpt:
         config, state = ckpt["config"], ckpt["model"]
-        print(f"Loaded {path} (step {ckpt['step']}, val loss {ckpt['val_loss']:.3f})")
+        arch = ", ".join(f"{k}={config[k]}" for k in ("norm", "pos", "mlp") if k in config)
+        print(f"Loaded {path} (step {ckpt['step']}, val loss {ckpt['val_loss']:.3f}"
+              f"{', ' + arch if arch else ''})")
     else:
         # older checkpoints hold only the weights; recover the sizes from their shapes.
         # n_heads can't be read from the weights, so it falls back to train.py's value
@@ -43,7 +52,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=40)
     parser.add_argument("--seed", type=int, default=None, help="set for repeatable output")
-    parser.add_argument("--ckpt", default="mini_gpt.pt")
+    parser.add_argument("--ckpt", default=None, help="default: newest file in checkpoints/")
     parser.add_argument("--tokenizer", default=os.path.join("data", "tokenizer.json"))
     args = parser.parse_args()
 
@@ -55,7 +64,7 @@ if __name__ == "__main__":
     tok.load(args.tokenizer)
     eot_id = tok.special_tokens["<|endoftext|>"]
 
-    model = load_model(args.ckpt, device)
+    model = load_model(args.ckpt or latest_checkpoint(), device)
     if model.token_emb.weight.shape[0] != tok.vocab_size:
         raise SystemExit(f"Checkpoint vocab ({model.token_emb.weight.shape[0]}) doesn't match "
                          f"tokenizer vocab ({tok.vocab_size}); wrong tokenizer for this model?")
