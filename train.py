@@ -1,3 +1,4 @@
+import argparse
 import csv
 import math
 import os
@@ -8,7 +9,19 @@ import torch
 from tokenizer import BPETokenizer
 from model import GPT
 
-torch.manual_seed(0)
+# every run is set from the command line so A/B runs differ in exactly one thing, e.g.
+#   python train.py --name baseline --steps 4000
+#   python train.py --name rmsnorm --steps 4000 --norm rmsnorm
+parser = argparse.ArgumentParser()
+parser.add_argument("--name", default="run", help="run name, used for the log and checkpoint files")
+parser.add_argument("--steps", type=int, default=None, help="training steps (default: one epoch)")
+parser.add_argument("--norm", default="layernorm", choices=["layernorm", "rmsnorm"])
+parser.add_argument("--pos", default="learned", choices=["learned", "rope"])
+parser.add_argument("--mlp", default="gelu", choices=["gelu", "swiglu"])
+parser.add_argument("--seed", type=int, default=0)
+args = parser.parse_args()
+
+torch.manual_seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 # data: token ids written by prepare_data.py
@@ -29,9 +42,14 @@ print(f"Train tokens: {len(train_data):,} | val tokens: {len(val_data):,}")
 # context length; most TinyStories fit in 256 tokens
 BLOCK_SIZE = 256
 
-def get_batch(split, batch_size):
+# batches come from their own random generator, so two runs with the same seed see
+# the same batches in the same order even if their models use up different amounts
+# of randomness at initialization. that keeps A/B comparisons fair
+batch_gen = torch.Generator().manual_seed(args.seed)
+
+def get_batch(split, batch_size, generator=batch_gen):
     d = train_data if split == "train" else val_data
-    ix = torch.randint(len(d) - BLOCK_SIZE - 1, (batch_size,)).tolist()
+    ix = torch.randint(len(d) - BLOCK_SIZE - 1, (batch_size,), generator=generator).tolist()
     x = torch.stack([torch.from_numpy(d[i:i + BLOCK_SIZE].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(d[i + 1:i + BLOCK_SIZE + 1].astype(np.int64)) for i in ix])
     return x.to(device), y.to(device)
@@ -47,6 +65,9 @@ MODEL_CONFIG = dict(
     max_seq_len=BLOCK_SIZE,
     # each token is seen about once, so there is nothing to memorize and no need for dropout
     dropout=0.0,
+    norm=args.norm,
+    pos=args.pos,
+    mlp=args.mlp,
 )
 model = GPT(**MODEL_CONFIG).to(device)
 
@@ -58,7 +79,7 @@ EPOCHS = 1
 # one epoch = as many tokens as the training set holds. batches are random windows,
 # so this is one epoch on average, not a guarantee that every token is seen exactly once
 TOKENS_PER_STEP = BATCH_SIZE * BLOCK_SIZE
-MAX_STEPS = int(EPOCHS * len(train_data) // TOKENS_PER_STEP)
+MAX_STEPS = args.steps or int(EPOCHS * len(train_data) // TOKENS_PER_STEP)
 # each eval runs 100 batches without training, so evaluating less often saves time
 EVAL_INTERVAL = 250
 
@@ -82,11 +103,12 @@ optimizer = torch.optim.AdamW([
 ], lr=MAX_LR, betas=(0.9, 0.95))
 
 GRAD_CLIP = 1.0
-CKPT_PATH = "mini_gpt.pt"
+os.makedirs("checkpoints", exist_ok=True)
+CKPT_PATH = os.path.join("checkpoints", f"{args.name}.pt")
 
-# one CSV per run, named by start time, so runs can be compared with plot_losses.py
+# one CSV per run, named by run name and start time, so runs can be compared with plot_losses.py
 os.makedirs("logs", exist_ok=True)
-LOG_PATH = os.path.join("logs", time.strftime("run_%Y%m%d_%H%M%S.csv"))
+LOG_PATH = os.path.join("logs", time.strftime(f"{args.name}_%Y%m%d_%H%M%S.csv"))
 log_file = open(LOG_PATH, "w", newline="")
 log = csv.writer(log_file)
 log.writerow(["step", "tokens", "train_loss", "val_loss", "lr", "elapsed_s"])
@@ -96,16 +118,21 @@ def estimate_loss(eval_iters=50):
     model.eval()
     out = {}
     for split in ("train", "val"):
+        # the same fixed batches at every eval and in every run, so changes in
+        # val loss come from the model, not from which windows were drawn
+        eval_gen = torch.Generator().manual_seed(1234)
         losses = torch.zeros(eval_iters)
         for i in range(eval_iters):
-            x, y = get_batch(split, BATCH_SIZE)
+            x, y = get_batch(split, BATCH_SIZE, generator=eval_gen)
             _, loss = model(x, y)
             losses[i] = loss.item()
         out[split] = losses.mean().item()
     model.train()
     return out
 
-print(f"\nTraining for {MAX_STEPS} steps ({EPOCHS} epoch, {MAX_STEPS * TOKENS_PER_STEP:,} tokens) on {device}...")
+print(f"Run '{args.name}': norm={args.norm} pos={args.pos} mlp={args.mlp} seed={args.seed}")
+print(f"\nTraining for {MAX_STEPS} steps ({MAX_STEPS * TOKENS_PER_STEP / len(train_data):.2f} epochs, "
+      f"{MAX_STEPS * TOKENS_PER_STEP:,} tokens) on {device}...")
 print(f"Logging to {LOG_PATH}")
 t0 = time.time()
 best_val = float("inf")

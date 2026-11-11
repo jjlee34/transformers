@@ -3,8 +3,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+# modern (Llama-style) replacements, each switched on by an option in GPT:
+#   norm="rmsnorm"  -> RMSNorm instead of LayerNorm
+#   pos="rope"      -> rotary position embeddings instead of a learned pos_emb table
+#   mlp="swiglu"    -> gated SwiGLU MLP instead of the GELU MLP
+# the defaults ("layernorm", "learned", "gelu") are the original GPT-2 model
+
+class RMSNorm(nn.Module):
+    # LayerNorm subtracts the mean, divides by the std, then scales and shifts.
+    # RMSNorm skips the mean and the shift: it only divides by the root-mean-square
+    # and scales. cheaper, and works as well in practice
+    def __init__(self, d_model, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+def make_norm(norm, d_model):
+    if norm == "layernorm":
+        return nn.LayerNorm(d_model)
+    if norm == "rmsnorm":
+        return RMSNorm(d_model)
+    raise ValueError(f"unknown norm {norm!r}")
+
+class Rotary(nn.Module):
+    # RoPE: instead of adding a position vector to the token embedding, rotate q and k
+    # by an angle that grows with position. each pair of dimensions (0,1), (2,3), ...
+    # rotates at its own speed. the dot product q_i . k_j then depends only on the
+    # distance i - j, so attention sees relative position directly
+    def __init__(self, d_head, max_seq_len, base=10000):
+        super().__init__()
+        # one frequency per dimension pair: fast for the first pairs, slow for the last
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head))
+        # angle for every (position, pair): (max_seq_len, d_head / 2)
+        angles = torch.outer(torch.arange(max_seq_len).float(), inv_freq)
+        self.register_buffer("cos", angles.cos(), persistent=False)
+        self.register_buffer("sin", angles.sin(), persistent=False)
+
+    def forward(self, x):
+        # x: (B, n_heads, T, d_head)
+        T = x.shape[-2]
+        cos, sin = self.cos[:T], self.sin[:T]
+        # split each vector into its pairs and rotate every pair by its angle
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        return rotated.flatten(-2)
+
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, max_seq_len=1024, dropout=0.0):
+    def __init__(self, d_model, n_heads, max_seq_len=1024, dropout=0.0, rope=False):
         super().__init__()
         assert d_model % n_heads == 0
 
@@ -21,6 +70,8 @@ class MultiHeadSelfAttention(nn.Module):
         causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len)).bool()
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
+        self.rotary = Rotary(self.d_head, max_seq_len) if rope else None
+
     def forward(self, x):
         # batch, sequence length, and d_model
         B, T, C = x.shape
@@ -34,6 +85,11 @@ class MultiHeadSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        # RoPE puts position into q and k only; v carries content and is left alone
+        if self.rotary is not None:
+            q = self.rotary(q)
+            k = self.rotary(k)
 
         # scaled dot-product attention
         attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
@@ -73,46 +129,65 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, max_seq_len=1024, dropout=0.0):
+class SwiGLU(nn.Module):
+    # gated MLP: one projection (gate) decides how much of another (up) to let through,
+    # per hidden unit. SiLU(x) = x * sigmoid(x) is a smooth GELU-like activation.
+    # three matrices instead of two, so the hidden size is 8/3 * d_model rather than
+    # 4 * d_model to keep the parameter count about the same as the GELU MLP
+    def __init__(self, d_model, dropout=0.0):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, n_heads, max_seq_len, dropout)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = MLP(d_model, dropout=dropout)
+        d_hidden = int(8 * d_model / 3)
+        self.gate = nn.Linear(d_model, d_hidden)
+        self.up = nn.Linear(d_model, d_hidden)
+        self.down = nn.Linear(d_hidden, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, max_seq_len=1024, dropout=0.0,
+                 norm="layernorm", rope=False, mlp="gelu"):
+        super().__init__()
+        self.ln1 = make_norm(norm, d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_heads, max_seq_len, dropout, rope)
+        self.ln2 = make_norm(norm, d_model)
+        if mlp == "gelu":
+            self.mlp = MLP(d_model, dropout=dropout)
+        elif mlp == "swiglu":
+            self.mlp = SwiGLU(d_model, dropout=dropout)
+        else:
+            raise ValueError(f"unknown mlp {mlp!r}")
     def forward(self, x):
         # pre-norm and residual to normalize before the sublayer
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
 
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    B, T, d_model, n_heads = 2, 16, 256, 8
-
-    block = TransformerBlock(d_model, n_heads, max_seq_len=T)
-    x = torch.randn(B, T, d_model)
-    out = block(x)
-
-    print("input shape: ", x.shape)
-    print("output shape: ", out.shape)
-
 class GPT(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=4,
-                 max_seq_len=256, dropout=0.0):
+                 max_seq_len=256, dropout=0.0,
+                 norm="layernorm", pos="learned", mlp="gelu"):
         super().__init__()
         self.max_seq_len = max_seq_len
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        # with RoPE, position goes into attention instead, so there is no pos_emb table
+        if pos == "learned":
+            self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        elif pos == "rope":
+            self.pos_emb = None
+        else:
+            raise ValueError(f"unknown pos {pos!r}")
         self.drop = nn.Dropout(dropout)
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, max_seq_len, dropout)
+            TransformerBlock(d_model, n_heads, max_seq_len, dropout,
+                             norm=norm, rope=(pos == "rope"), mlp=mlp)
             for _ in range(n_layers)
         ])
 
-        self.ln_f = nn.LayerNorm(d_model)
+        self.ln_f = make_norm(norm, d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         self.lm_head.weight = self.token_emb.weight
@@ -132,8 +207,10 @@ class GPT(nn.Module):
         B, T = idx.shape
         assert T <= self.max_seq_len, f"sequence lenght {T} exceeds max_seq_len {self.max_seq_len}"
 
-        positions = torch.arange(T, device=idx.device)
-        x = self.token_emb(idx) + self.pos_emb(positions)
+        x = self.token_emb(idx)
+        if self.pos_emb is not None:
+            positions = torch.arange(T, device=idx.device)
+            x = x + self.pos_emb(positions)
         x = self.drop(x)
 
         for block in self.blocks:
