@@ -9,9 +9,7 @@ from tokenizer import BPETokenizer
 
 # generates text from a trained checkpoint without retraining
 # usage:
-#   python inference.py
-#   python inference.py --prompt "Lily had a red ball" --num_samples 3 --temperature 0.7
-#   python inference.py --ckpt checkpoints/rmsnorm.pt
+
 
 def latest_checkpoint():
     # newest file in checkpoints/, falling back to the older single-file location
