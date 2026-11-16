@@ -43,10 +43,11 @@ class Rotary(nn.Module):
         self.register_buffer("cos", angles.cos(), persistent=False)
         self.register_buffer("sin", angles.sin(), persistent=False)
 
-    def forward(self, x):
-        # x: (B, n_heads, T, d_head)
+    def forward(self, x, offset=0):
+        # x: (B, n_heads, T, d_head). offset is the position of the first of the T vectors:
+        # 0 in training, and the number of cached tokens when generating with a KV cache
         T = x.shape[-2]
-        cos, sin = self.cos[:T], self.sin[:T]
+        cos, sin = self.cos[offset:offset + T], self.sin[offset:offset + T]
         # split each vector into its pairs and rotate every pair by its angle
         x1, x2 = x[..., 0::2], x[..., 1::2]
         rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
@@ -72,9 +73,13 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.rotary = Rotary(self.d_head, max_seq_len) if rope else None
 
-    def forward(self, x):
+    def forward(self, x, cache=None):
+        # cache is None in training. when generating, it is this layer's dict holding the
+        # k and v of every earlier token, so only the new tokens need computing (KV cache)
         # batch, sequence length, and d_model
         B, T, C = x.shape
+        # how many tokens are already cached; the new ones start at this position
+        past = cache["k"].shape[-2] if cache else 0
 
         # (B, T, 3*C)
         qkv = self.qkv_proj(x)
@@ -88,14 +93,25 @@ class MultiHeadSelfAttention(nn.Module):
 
         # RoPE puts position into q and k only; v carries content and is left alone
         if self.rotary is not None:
-            q = self.rotary(q)
-            k = self.rotary(k)
+            q = self.rotary(q, offset=past)
+            k = self.rotary(k, offset=past)
 
-        # scaled dot-product attention
+        # KV cache: earlier tokens' k and v never change (causal attention means a token
+        # only sees what came before it), so store them and append the new ones.
+        # q is only needed for the new tokens, since only they need an output
+        if cache is not None:
+            if cache:
+                k = torch.cat([cache["k"], k], dim=-2)
+                v = torch.cat([cache["v"], v], dim=-2)
+            cache["k"], cache["v"] = k, v
+
+        # scaled dot-product attention. q: (B, H, T, d_head), k: (B, H, past + T, d_head)
         attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
 
-        # apply causal mask
-        attn_scores = attn_scores.masked_fill(~self.causal_mask[:T, :T], float('-inf'))
+        # apply causal mask. the T queries sit at positions past .. past+T-1, so take
+        # those rows of the mask, and columns for every key up to past+T
+        attn_scores = attn_scores.masked_fill(
+            ~self.causal_mask[past:past + T, :past + T], float('-inf'))
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
@@ -158,9 +174,9 @@ class TransformerBlock(nn.Module):
             self.mlp = SwiGLU(d_model, dropout=dropout)
         else:
             raise ValueError(f"unknown mlp {mlp!r}")
-    def forward(self, x):
+    def forward(self, x, cache=None):
         # pre-norm and residual to normalize before the sublayer
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x), cache)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -202,19 +218,22 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, caches=None):
         # B: batch size, T: length of sequences (context window)
+        # caches: None in training; in generation, one dict per block (see generate)
         B, T = idx.shape
-        assert T <= self.max_seq_len, f"sequence lenght {T} exceeds max_seq_len {self.max_seq_len}"
+        past = caches[0]["k"].shape[-2] if caches and caches[0] else 0
+        assert past + T <= self.max_seq_len, \
+            f"sequence length {past + T} exceeds max_seq_len {self.max_seq_len}"
 
         x = self.token_emb(idx)
         if self.pos_emb is not None:
-            positions = torch.arange(T, device=idx.device)
+            positions = torch.arange(past, past + T, device=idx.device)
             x = x + self.pos_emb(positions)
         x = self.drop(x)
 
-        for block in self.blocks:
-            x = block(x)
+        for i, block in enumerate(self.blocks):
+            x = block(x, caches[i] if caches is not None else None)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -227,10 +246,20 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eot_id=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eot_id=None,
+                 use_cache=True):
+        # with the cache, the prompt is run once to fill it, then each step feeds in only
+        # the one new token instead of the whole sequence again
+        caches = [{} for _ in self.blocks] if use_cache else None
+        new_tokens = idx
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.max_seq_len:]
-            logits, _ = self(idx_cond)
+            if use_cache and idx.shape[1] <= self.max_seq_len:
+                logits, _ = self(new_tokens, caches=caches)
+            else:
+                # the model has no positions past max_seq_len, so once the text is longer
+                # than that, recompute from the last max_seq_len tokens each step
+                # (sliding window), as without a cache
+                logits, _ = self(idx[:, -self.max_seq_len:])
             logits = logits[:, -1, :] / temperature
 
             if top_k is not None:
@@ -239,6 +268,7 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
+            new_tokens = next_id
             # stop once every sequence in the batch has produced <|endoftext|>
             if eot_id is not None and (next_id == eot_id).all():
                 break
