@@ -3,7 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
+# modern (Llama-style) replacements, each switched on by an option in GPT:
+#   norm="rmsnorm"  -> RMSNorm instead of LayerNorm
+#   pos="rope"      -> rotary position embeddings instead of a learned pos_emb table
+#   mlp="swiglu"    -> gated SwiGLU MLP instead of the GELU MLP
+# the defaults ("layernorm", "learned", "gelu") are the original GPT-2 model
 
 class RMSNorm(nn.Module):
     # LayerNorm subtracts the mean, divides by the std, then scales and shifts.
